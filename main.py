@@ -12,26 +12,47 @@ rolling unlocks bring New Zealand and Asia first, then Europe, then the big
 jumps when the US East (05:00Z) and US West (08:00Z) midnights hit, then a
 broad evening peak. Launches of a similar size share a similar curve, so each
 comparable is weighted by how close its own hour-1 print is to the target's,
-with a Gaussian kernel on log hour-1 (width 1.0):
+with a wide Gaussian kernel on log hour-1 (width 2.5):
 
-    w = exp(-((ln h1_comp - ln h1_target) / 1.0) ** 2)
+    w = exp(-((ln h1_comp - ln h1_target) / 2.5) ** 2)
+
+A wide kernel matters: with a narrow one the pool is a handful of
+near-neighbours and the average sits inside their range, while the wide
+kernel pools the whole launch population and lets the size trend (below) do
+the work. Weak analogues keep half weight.
+
+Unlock type matters as much as size. Rolling-midnight launches (one region's
+midnight after another) share one shape; simultaneous global unlocks share
+another, and mixing the two families blurs both. So a comparable whose unlock
+note does not describe a rolling midnight keeps only a quarter of its weight.
+GTA VI itself unlocks on rolling midnights, and on the eight big rolling
+launches in leave-one-out validation this weighting cuts the loss by about
+8%, while the four rolling practice launches improve by about a fifth.
 
 Two kinds of comparables are left out of the pool: the target game's own
 pre-release history (not a launch at all), and launches whose release day was
 contaminated by a days-earlier early-access opening (their "release day" curve
 is really day three of play, so its shape does not match a fresh launch).
-Weak analogues keep a quarter weight.
 
 For each forecast hour we take the weighted quantiles of the pooled log-ratios
 at the five scored levels and exponentiate back against the target's hour-1
 print. The centre comes from two estimators, averaged in log space: the plain
-kernel-weighted quantiles, and a local-linear fit of log-ratio on the log
-hour-1 gap (evaluated at the target, gap zero) whose spread is the weighted
-quantiles of the fit's residuals. The linear term matters because the target
-may be bigger than every comparable: a plain average can only sit inside the
-range of past launches, while the fit carries the size trend to the target's
-own scale. Averaging the two keeps either one's failure mode from dominating.
+kernel-weighted quantiles (weight 0.125), and a local-linear fit of log-ratio
+on the log hour-1 gap (evaluated at the target, gap zero) whose spread is the
+weighted quantiles of the fit's residuals (weight 0.875). The linear term
+matters because the target may be bigger than every comparable: a plain
+average can only sit inside the range of past launches, while the fit carries
+the size trend to the target's own scale. Averaging the two keeps either one's
+failure mode from dominating. Finally the quantiles are pulled 10% toward the
+median: the pooled spreads run slightly wide on big launches.
 No randomness anywhere: same input, same bytes out.
+
+Validation (leave-one-launch-out over the 38 comparables, and the four
+practice launches against SullyGnome ground truth): LOO 0.408, LOO on
+hour-1 >= 100k launches 0.232, LOO on big rolling launches 0.157, practice
+mean pinball loss 0.153 (0.146 with the final pool of 42 comparables, which
+includes the other practice launches). House persistence baseline:
+practice 0.387.
 
 Run by the grader as `python3 -P -s /bot/main.py` (Python 3.13, stdlib only,
 no network). Outside the grader, MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand
@@ -54,9 +75,16 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Width of the log hour-1 similarity kernel (natural-log units).
-KERNEL_WIDTH = 1.0
+KERNEL_WIDTH = 2.5
 # Weight kept for comparables marked a weak analogue.
-WEAK_WEIGHT = 0.25
+WEAK_WEIGHT = 0.5
+# Weight of the plain kernel-quantile estimator; the local-linear fit takes
+# the rest (1 - KERNEL_BLEND).
+KERNEL_BLEND = 0.125
+# Spread scale: quantiles are pulled this far toward the median.
+SPREAD_SCALE = 0.9
+# Weight kept for comparables whose unlock is not a rolling midnight.
+FIXED_WEIGHT = 0.25
 # Hard caps the rules put on any forecast value.
 MAX_VIEWERS = 1e9
 # Fallback spread (log units per sqrt hour) if no comparable survives filtering.
@@ -88,6 +116,17 @@ def tier_of(comp: dict) -> str:
     if "Tier: weak" in text:
         return "weak"
     return "comparable"
+
+
+def is_rolling(comp: dict) -> bool:
+    """True when the comparable's unlock note describes a rolling midnight.
+
+    The note is free text, so this is keyword matching; anything it cannot
+    recognise counts as not rolling and is downweighted, not dropped.
+    """
+    text = (comp.get("unlock") or "").lower()
+    return ("rolling" in text or "midnight local" in text
+            or "midnight in each" in text or "local midnight" in text)
 
 
 def release_day_curve(comp: dict) -> list[float] | None:
@@ -144,6 +183,9 @@ def ratio_quantiles(case: dict, hour1: float) -> list[list[float]]:
     the pooled log-ratios. (2) A local-linear fit of log-ratio on the log
     hour-1 gap, read at the target (gap zero), with spread from the weighted
     quantiles of the fit residuals. Both use the same similarity weights.
+    Non-rolling comparables keep only FIXED_WEIGHT: their shape family
+    differs from a rolling-midnight launch's. The merged quantiles are
+    pulled SPREAD_SCALE of the way toward the median.
     """
     log_h1 = math.log(hour1)
     pool: list[tuple[float, float, list[float]]] = []  # (weight, log-h1 gap, 23 log-ratios)
@@ -158,6 +200,8 @@ def ratio_quantiles(case: dict, hour1: float) -> list[list[float]]:
         weight = math.exp(-((gap / KERNEL_WIDTH) ** 2))
         if tier == "weak":
             weight *= WEAK_WEIGHT
+        if not is_rolling(comp):
+            weight *= FIXED_WEIGHT
         ratios = [math.log(curve[h] / curve[0]) for h in range(1, 24)]
         pool.append((weight, gap, ratios))
     if not pool:
@@ -179,7 +223,10 @@ def ratio_quantiles(case: dict, hour1: float) -> list[list[float]]:
         resid = [(ratios[h] - (centre + slope * x), w)
                  for w, x, ratios in pool]
         linear_qs = [centre + weighted_quantile(resid, tau) for tau in LEVELS]
-        out.append([(kq + lq) / 2.0 for kq, lq in zip(kernel_qs, linear_qs)])
+        merged = [KERNEL_BLEND * kq + (1 - KERNEL_BLEND) * lq
+                  for kq, lq in zip(kernel_qs, linear_qs)]
+        median = merged[2]
+        out.append([median + SPREAD_SCALE * (q - median) for q in merged])
     return out
 
 
